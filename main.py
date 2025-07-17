@@ -18,6 +18,9 @@ from keras.models import Sequential
 from keras.layers import Input, TimeDistributed, Dropout, Flatten, LSTM, Bidirectional, Dense
 from keras.applications.mobilenet_v2 import MobileNetV2
 
+import pywhatkit as kit
+import subprocess
+
 warnings.filterwarnings("ignore")
 
 class CameraManager:
@@ -35,11 +38,23 @@ class CameraManager:
             except:
                 self.cameras = {}
         else:
-            # Default cameras
+            # Default cameras with officer phone numbers
             self.cameras = {
-                "0": {"name": "Default Camera", "location": "Main Entrance"},
-                "1": {"name": "Camera 1", "location": "Lobby"},
-                "2": {"name": "Camera 2", "location": "Parking"}
+                "0": {
+                    "name": "Default Camera", 
+                    "location": "Main Entrance",
+                    "officer_phone": "+1234567890"
+                },
+                "1": {
+                    "name": "Camera 1", 
+                    "location": "Lobby",
+                    "officer_phone": "+1234567891"
+                },
+                "2": {
+                    "name": "Camera 2", 
+                    "location": "Parking",
+                    "officer_phone": "+1234567892"
+                }
             }
             self.save_camera_config()
             
@@ -51,14 +66,22 @@ class CameraManager:
         except Exception as e:
             print(f"Error saving camera config: {e}")
             
-    def add_camera(self, camera_id, name, location):
-        """Add or update camera"""
-        self.cameras[str(camera_id)] = {"name": name, "location": location}
+    def add_camera(self, camera_id, name, location, officer_phone):
+        """Add or update camera with officer phone"""
+        self.cameras[str(camera_id)] = {
+            "name": name, 
+            "location": location,
+            "officer_phone": officer_phone
+        }
         self.save_camera_config()
         
     def get_camera_info(self, camera_id):
         """Get camera information"""
-        return self.cameras.get(str(camera_id), {"name": f"Camera {camera_id}", "location": "Unknown"})
+        return self.cameras.get(str(camera_id), {
+            "name": f"Camera {camera_id}", 
+            "location": "Unknown",
+            "officer_phone": "+0000000000"
+        })
         
     def get_all_cameras(self):
         """Get all cameras"""
@@ -71,11 +94,17 @@ class AlertSystem:
         self.alerts = []
         self.alerts_dir = "alerts"
         self.metadata_file = "alerts/alerts_metadata.json"
-        self.last_alert_time = {'fire': None, 'violence': None}
+        
+        # Enhanced alert tracking - track by camera location and detection type
+        self.last_alert_time = {}  # Format: {f"{camera_location}_{detection_type}": datetime}
+        self.last_alert_details = {}  # Format: {f"{camera_location}_{detection_type}": {"confidence": float, "count": int}}
         
         # Initialize text-to-speech engine
         self.tts_engine = pyttsx3.init()
         self.tts_engine.setProperty('rate', 170)  # Set speech rate (optional)
+        
+        # WhatsApp settings
+        self.whatsapp_enabled = True
         
         # Create alerts directory if it doesn't exist
         if not os.path.exists(self.alerts_dir):
@@ -83,6 +112,9 @@ class AlertSystem:
             
         # Load existing alerts metadata
         self.load_alerts_metadata()
+        
+        # Path to Arduino script
+        self.arduino_script = "arduino.py"
         
     def load_alerts_metadata(self):
         """Load existing alerts metadata from file"""
@@ -98,38 +130,173 @@ class AlertSystem:
     def save_alerts_metadata(self):
         """Save alerts metadata to file"""
         try:
+            # Convert numpy types to Python native types for JSON serialization
+            serializable_alerts = []
+            for alert in self.alerts:
+                serializable_alert = alert.copy()
+                
+                # Convert numpy float32/float64 to Python float
+                if isinstance(serializable_alert['confidence'], (np.float32, np.float64)):
+                    serializable_alert['confidence'] = float(serializable_alert['confidence'])
+                
+                # Convert numpy arrays in details to Python lists
+                if 'details' in serializable_alert and serializable_alert['details']:
+                    details = serializable_alert['details'].copy()
+                    if 'probabilities' in details:
+                        if isinstance(details['probabilities'], np.ndarray):
+                            details['probabilities'] = details['probabilities'].tolist()
+                        elif isinstance(details['probabilities'], list):
+                            # Convert individual numpy float32/float64 to Python float
+                            details['probabilities'] = [float(p) if isinstance(p, (np.float32, np.float64)) else p 
+                                                       for p in details['probabilities']]
+                    serializable_alert['details'] = details
+                
+                serializable_alerts.append(serializable_alert)
+            
             with open(self.metadata_file, 'w') as f:
-                json.dump(self.alerts, f, indent=2)
+                json.dump(serializable_alerts, f, indent=2)
         except Exception as e:
             print(f"Error saving alerts metadata: {e}")
             
-    def can_create_alert(self, detection_type, delay_seconds):
-        """Check if enough time has passed since last alert of this type"""
-        if self.last_alert_time[detection_type] is None:
+    def can_create_alert(self, detection_type, delay_seconds, camera_location, confidence=None):
+        """
+        Enhanced alert prevention - check if enough time has passed since last alert 
+        for this specific camera location and detection type
+        """
+        alert_key = f"{camera_location}_{detection_type}"
+        
+        if alert_key not in self.last_alert_time:
             return True
             
-        time_since_last = datetime.now() - self.last_alert_time[detection_type]
-        return time_since_last.total_seconds() >= delay_seconds
+        time_since_last = datetime.now() - self.last_alert_time[alert_key]
+        time_passed = time_since_last.total_seconds()
+        
+        # Check if enough time has passed
+        if time_passed < delay_seconds:
+            return False
+            
+        # Additional check: if confidence is similar to last alert, extend delay
+        if alert_key in self.last_alert_details and confidence is not None:
+            last_confidence = self.last_alert_details[alert_key].get('confidence', 0)
+            confidence_diff = abs(confidence - last_confidence)
+            
+            # If confidence is very similar (within 0.1), extend delay by 50%
+            if confidence_diff < 0.1:
+                extended_delay = delay_seconds * 1.5
+                if time_passed < extended_delay:
+                    return False
+        
+        return True
+        
+    def update_alert_tracking(self, detection_type, camera_location, confidence):
+        """Update tracking information for this alert"""
+        alert_key = f"{camera_location}_{detection_type}"
+        current_time = datetime.now()
+        
+        self.last_alert_time[alert_key] = current_time
+        
+        if alert_key not in self.last_alert_details:
+            self.last_alert_details[alert_key] = {"confidence": confidence, "count": 1}
+        else:
+            self.last_alert_details[alert_key]["confidence"] = confidence
+            self.last_alert_details[alert_key]["count"] += 1
+            
+    def get_alert_statistics(self):
+        """Get statistics about recent alerts"""
+        stats = {}
+        current_time = datetime.now()
+        
+        for alert_key, last_time in self.last_alert_time.items():
+            time_since_last = current_time - last_time
+            details = self.last_alert_details.get(alert_key, {})
+            
+            stats[alert_key] = {
+                "last_alert": last_time.isoformat(),
+                "time_since_last": time_since_last.total_seconds(),
+                "total_alerts": details.get("count", 0),
+                "last_confidence": details.get("confidence", 0)
+            }
+            
+        return stats
+        
+    def get_time_until_next_alert(self, detection_type, delay_seconds, camera_location):
+        """Get time remaining until next alert can be sent"""
+        alert_key = f"{camera_location}_{detection_type}"
+        
+        if alert_key not in self.last_alert_time:
+            return 0
+            
+        time_since_last = datetime.now() - self.last_alert_time[alert_key]
+        time_passed = time_since_last.total_seconds()
+        
+        if time_passed >= delay_seconds:
+            return 0
+            
+        return delay_seconds - time_passed
+        
+    def send_whatsapp_message(self, phone_number, detection_type, confidence, camera_info, messaging_delay=20):
+        """Send instant WhatsApp message to officer"""
+        try:
+            if not self.whatsapp_enabled:
+                print(f"WhatsApp messaging is disabled - skipping message to {phone_number}")
+                return False
+                
+            # Format phone number (ensure it starts with +)
+            if not phone_number.startswith('+'):
+                phone_number = '+' + phone_number.lstrip('+0')
+            
+            # Create alert message
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conf_percent = confidence * 100 if isinstance(confidence, float) else confidence
+            
+            message = (
+                f"🚨 SECURITY ALERT 🚨\n\n"
+                f"Type: {detection_type.upper()}\n"
+                f"Location: {camera_info['location']}\n"
+                f"Camera: {camera_info['name']}\n"
+                f"Confidence: {conf_percent:.1f}%\n"
+                f"Time: {timestamp}\n\n"
+                f"Please respond immediately!"
+            )
+            
+            # Send instant WhatsApp message
+            kit.sendwhatmsg_instantly(
+                phone_number, 
+                message,
+                wait_time=messaging_delay,  # Use user-set delay
+                tab_close=True
+            )
+            
+            print(f"WhatsApp message sent to {phone_number}")
+            return True
+            
+        except Exception as e:
+            print(f"WhatsApp sending error: {e}")
+            return False
+            
+    def is_messaging_enabled(self):
+        """Check if WhatsApp messaging is enabled"""
+        return self.whatsapp_enabled
             
     def speak_alert(self, detection_type, confidence, camera_info):
         """Speak out the alert details using TTS"""
         try:
             location = camera_info.get('location', 'Unknown location')
             camera_name = camera_info.get('name', 'Unknown camera')
-            conf_percent = int(round(confidence * 100)) if isinstance(confidence, float) else confidence
+            conf_percent = confidence * 100 if isinstance(confidence, float) else confidence
             message = (
                 f"Alert! {detection_type.capitalize()} detected. "
                 f"Location: {location}. "
                 f"Camera: {camera_name}. "
-                f"Confidence: {(conf_percent*100):.2f} percent."
+                f"Confidence: {conf_percent:.1f} percent."
             )
             self.tts_engine.say(message)
             self.tts_engine.runAndWait()
         except Exception as e:
             print(f"Text-to-speech error: {e}")
             
-    def save_alert(self, frame, detection_type, confidence, camera_info, details=None):
-        """Save an alert with frame snapshot and speak out the alert"""
+    def save_alert(self, frame, detection_type, confidence, camera_info, details=None, messaging_delay=20):
+        """Save an alert with frame snapshot, speak out the alert, and send WhatsApp"""
         timestamp = datetime.now()
         filename = f"{detection_type}_{camera_info['name'].replace(' ', '_')}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
         filepath = os.path.join(self.alerts_dir, filename)
@@ -137,15 +304,25 @@ class AlertSystem:
         # Save frame
         cv2.imwrite(filepath, frame)
         
+        # Extract confidence value properly
+        if hasattr(confidence, 'item'):
+            conf_value = confidence.item()
+        elif isinstance(confidence, (np.float32, np.float64)):
+            conf_value = float(confidence)
+        else:
+            conf_value = confidence
+        
         # Create alert record
         alert_record = {
             'timestamp': timestamp.isoformat(),
             'type': detection_type,
-            'confidence': confidence.item(),
+            'confidence': conf_value,
             'filename': filename,
             'filepath': filepath,
             'camera_name': camera_info['name'],
             'camera_location': camera_info['location'],
+            'officer_phone': camera_info.get('officer_phone', 'N/A'),
+            'whatsapp_sent': False,
             'details': details or {}
         }
         
@@ -153,15 +330,36 @@ class AlertSystem:
         self.alerts.insert(0, alert_record)  # Insert at beginning for latest first
         
         # Update last alert time
-        self.last_alert_time[detection_type] = timestamp
+        self.update_alert_tracking(detection_type, camera_info['location'], conf_value)
         
         # Save metadata
         self.save_alerts_metadata()
         
+        # Run Arduino script (non-blocking)
+        self.run_arduino_script()
+        
         # Speak out the alert
-        self.speak_alert(detection_type, confidence, camera_info)
+        self.speak_alert(detection_type, conf_value, camera_info)
+        
+        # Send WhatsApp message in a separate thread
+        if camera_info.get('officer_phone') and camera_info['officer_phone'] not in ['N/A', '+0000000000']:
+            whatsapp_thread = threading.Thread(
+                target=self._send_whatsapp_async,
+                args=(camera_info['officer_phone'], detection_type, conf_value, camera_info, alert_record, messaging_delay),
+                daemon=True
+            )
+            whatsapp_thread.start()
         
         return alert_record
+    
+    def _send_whatsapp_async(self, phone_number, detection_type, confidence, camera_info, alert_record, messaging_delay):
+        """Send WhatsApp message asynchronously"""
+        try:
+            success = self.send_whatsapp_message(phone_number, detection_type, confidence, camera_info, messaging_delay)
+            alert_record['whatsapp_sent'] = success
+            self.save_alerts_metadata()  # Update with WhatsApp status
+        except Exception as e:
+            print(f"Async WhatsApp error: {e}")
         
     def get_alerts(self):
         """Get all alerts"""
@@ -179,8 +377,15 @@ class AlertSystem:
                     
         # Clear metadata and reset timers
         self.alerts = []
-        self.last_alert_time = {'fire': None, 'violence': None}
+        self.last_alert_time = {}
+        self.last_alert_details = {}
         self.save_alerts_metadata()
+
+    def run_arduino_script(self):
+        """Run the arduino.py script as a subprocess in a separate thread"""
+        def _run():
+                subprocess.run([sys.executable, self.arduino_script], check=True)
+        threading.Thread(target=_run, daemon=True).start()
 
 class CameraConfigDialog:
     def __init__(self, parent, camera_manager):
@@ -191,7 +396,7 @@ class CameraConfigDialog:
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Camera Configuration")
-        self.dialog.geometry("600x400")
+        self.dialog.geometry("750x550")
         self.dialog.transient(parent)
         self.dialog.grab_set()
         
@@ -214,23 +419,26 @@ class CameraConfigDialog:
         main_frame.rowconfigure(1, weight=1)
         
         # Title
-        ttk.Label(main_frame, text="Camera Configuration", font=('Arial', 14, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 20))
+        ttk.Label(main_frame, text="Camera Configuration with WhatsApp Alerts", 
+                 font=('Arial', 14, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 20))
         
         # Camera list
         list_frame = ttk.LabelFrame(main_frame, text="Existing Cameras", padding="10")
         list_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Treeview for cameras
-        columns = ('ID', 'Name', 'Location')
+        columns = ('ID', 'Name', 'Location', 'Officer Phone')
         self.camera_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=10)
         
         self.camera_tree.heading('ID', text='Camera ID')
         self.camera_tree.heading('Name', text='Name')
         self.camera_tree.heading('Location', text='Location')
+        self.camera_tree.heading('Officer Phone', text='Officer Phone')
         
-        self.camera_tree.column('ID', width=80)
-        self.camera_tree.column('Name', width=150)
-        self.camera_tree.column('Location', width=200)
+        self.camera_tree.column('ID', width=70)
+        self.camera_tree.column('Name', width=120)
+        self.camera_tree.column('Location', width=150)
+        self.camera_tree.column('Officer Phone', width=130)
         
         # Scrollbar
         tree_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.camera_tree.yview)
@@ -246,28 +454,53 @@ class CameraConfigDialog:
         form_frame = ttk.LabelFrame(main_frame, text="Add/Edit Camera", padding="10")
         form_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
         
+        # Row 1: Camera ID and Name
         ttk.Label(form_frame, text="Camera ID:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
         self.camera_id_var = tk.StringVar()
         ttk.Entry(form_frame, textvariable=self.camera_id_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
         
         ttk.Label(form_frame, text="Name:").grid(row=0, column=2, sticky=tk.W, padx=(0, 10))
         self.camera_name_var = tk.StringVar()
-        ttk.Entry(form_frame, textvariable=self.camera_name_var, width=20).grid(row=0, column=3, sticky=(tk.W, tk.E), padx=(0, 20))
+        ttk.Entry(form_frame, textvariable=self.camera_name_var, width=20).grid(row=0, column=3, sticky=(tk.W, tk.E))
         
+        # Row 2: Location
         ttk.Label(form_frame, text="Location:").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
         self.camera_location_var = tk.StringVar()
         location_entry = ttk.Entry(form_frame, textvariable=self.camera_location_var, width=40)
         location_entry.grid(row=1, column=1, columnspan=3, sticky=(tk.W, tk.E), pady=(10, 0))
         
+        # Row 3: Officer Phone
+        ttk.Label(form_frame, text="Officer Phone:").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
+        self.officer_phone_var = tk.StringVar()
+        phone_entry = ttk.Entry(form_frame, textvariable=self.officer_phone_var, width=20)
+        phone_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(10, 0), padx=(0, 10))
+        
+        # Phone format hint
+        ttk.Label(form_frame, text="(Format: +1234567890)", foreground="gray").grid(
+            row=2, column=2, columnspan=2, sticky=tk.W, pady=(10, 0))
+        
         form_frame.columnconfigure(3, weight=1)
         
         # Buttons
         button_frame = ttk.Frame(form_frame)
-        button_frame.grid(row=2, column=0, columnspan=4, pady=(15, 0))
+        button_frame.grid(row=3, column=0, columnspan=4, pady=(15, 0))
         
         ttk.Button(button_frame, text="Add/Update", command=self.add_camera).grid(row=0, column=0, padx=(0, 10))
         ttk.Button(button_frame, text="Delete", command=self.delete_camera).grid(row=0, column=1, padx=(0, 10))
-        ttk.Button(button_frame, text="Close", command=self.close_dialog).grid(row=0, column=2)
+        ttk.Button(button_frame, text="Test WhatsApp", command=self.test_whatsapp).grid(row=0, column=2, padx=(0, 10))
+        ttk.Button(button_frame, text="Close", command=self.close_dialog).grid(row=0, column=3)
+        
+        # WhatsApp instructions
+        instructions_frame = ttk.LabelFrame(main_frame, text="WhatsApp Setup Instructions", padding="10")
+        instructions_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        
+        instructions_text = """1. Make sure WhatsApp Web is logged in on your browser
+2. Phone numbers must include country code (e.g., +1 for US)
+3. Test messages will open WhatsApp Web automatically
+4. For instant alerts, keep WhatsApp Web open in browser"""
+        
+        ttk.Label(instructions_frame, text=instructions_text, justify=tk.LEFT, 
+                 wraplength=600, foreground="blue").grid(row=0, column=0, sticky=tk.W)
         
         # Bind selection
         self.camera_tree.bind('<<TreeviewSelect>>', self.on_camera_select)
@@ -279,7 +512,12 @@ class CameraConfigDialog:
             
         cameras = self.camera_manager.get_all_cameras()
         for camera_id, info in cameras.items():
-            self.camera_tree.insert('', 'end', values=(camera_id, info['name'], info['location']))
+            self.camera_tree.insert('', 'end', values=(
+                camera_id, 
+                info['name'], 
+                info['location'],
+                info.get('officer_phone', 'N/A')
+            ))
             
     def on_camera_select(self, event):
         """Handle camera selection"""
@@ -290,24 +528,71 @@ class CameraConfigDialog:
             self.camera_id_var.set(values[0])
             self.camera_name_var.set(values[1])
             self.camera_location_var.set(values[2])
+            self.officer_phone_var.set(values[3] if values[3] != 'N/A' else '')
             
     def add_camera(self):
         """Add or update camera"""
         camera_id = self.camera_id_var.get().strip()
         name = self.camera_name_var.get().strip()
         location = self.camera_location_var.get().strip()
+        officer_phone = self.officer_phone_var.get().strip()
         
         if not camera_id or not name or not location:
-            messagebox.showwarning("Warning", "Please fill in all fields")
+            messagebox.showwarning("Warning", "Please fill in Camera ID, Name, and Location fields")
             return
             
-        self.camera_manager.add_camera(camera_id, name, location)
+        # Validate phone number format if provided
+        if officer_phone and not officer_phone.startswith('+'):
+            messagebox.showwarning("Warning", "Phone number should start with + and include country code (e.g., +1234567890)")
+            return
+            
+        # Use default phone if none provided
+        if not officer_phone:
+            officer_phone = "+0000000000"
+            
+        self.camera_manager.add_camera(camera_id, name, location, officer_phone)
         self.refresh_camera_list()
         
         # Clear form
         self.camera_id_var.set("")
         self.camera_name_var.set("")
         self.camera_location_var.set("")
+        self.officer_phone_var.set("")
+        
+    def test_whatsapp(self):
+        """Test WhatsApp functionality"""
+        phone = self.officer_phone_var.get().strip()
+        if not phone:
+            messagebox.showwarning("Warning", "Please enter a phone number to test")
+            return
+            
+        if not phone.startswith('+'):
+            messagebox.showwarning("Warning", "Phone number should start with + and include country code")
+            return
+            
+        try:
+            # Send test message
+            test_message = (
+                f"🧪 TEST MESSAGE 🧪\n\n"
+                f"This is a test message from the Fire & Violence Detection System.\n"
+                f"Camera: {self.camera_name_var.get() or 'Test Camera'}\n"
+                f"Location: {self.camera_location_var.get() or 'Test Location'}\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"If you receive this, WhatsApp notifications are working correctly!"
+            )
+            
+            # Send immediately
+            kit.sendwhatmsg_instantly(
+                phone, 
+                test_message,
+                wait_time=20,
+                tab_close=True
+            )
+            
+            messagebox.showinfo("Success", f"Test message sent to {phone}\nCheck WhatsApp Web for delivery.")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to send test message: {str(e)}\n\nMake sure WhatsApp Web is logged in.")
         
     def delete_camera(self):
         """Delete selected camera"""
@@ -335,7 +620,7 @@ class CameraConfigDialog:
 class DetectionGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Fire & Violence Detection System with Alert Management")
+        self.root.title("Responda")
         self.root.geometry("1500x900")
         
         # Variables
@@ -360,8 +645,11 @@ class DetectionGUI:
         self.violence_alert_delay = tk.IntVar(value=15)  # 15 seconds between violence alerts
         
         # Alert thresholds
-        self.fire_threshold = tk.DoubleVar(value=0.16)
-        self.violence_threshold = tk.DoubleVar(value=0.5)
+        self.fire_threshold = tk.DoubleVar(value=0.80)
+        self.violence_threshold = tk.DoubleVar(value=0.99)
+        
+        # Messaging toggle
+        self.messaging_enabled = tk.BooleanVar(value=True)
         
         # Model variables
         self.fire_model = None
@@ -371,7 +659,7 @@ class DetectionGUI:
         self.models_loaded = False
         
         # Violence detection constants
-        self.SEQUENCE_LENGTH = 16
+        self.SEQUENCE_LENGTH = 4
         self.IMAGE_HEIGHT, self.IMAGE_WIDTH = 64, 64
         self.CLASSES_LIST = ["NonViolence", "Violence"]
         self.MODEL_PATH = 'violence_detection_model.h5'
@@ -452,7 +740,7 @@ class DetectionGUI:
         fire_threshold_scale = ttk.Scale(fire_threshold_frame, from_=0.1, to=0.9, orient=tk.HORIZONTAL,
                                         variable=self.fire_threshold, length=100)
         fire_threshold_scale.grid(row=0, column=1, padx=(5, 5))
-        self.fire_threshold_label = ttk.Label(fire_threshold_frame, text="0.16")
+        self.fire_threshold_label = ttk.Label(fire_threshold_frame, text="0.80")
         self.fire_threshold_label.grid(row=0, column=2)
         fire_threshold_scale.configure(command=self.update_fire_threshold_label)
         
@@ -461,10 +749,10 @@ class DetectionGUI:
         violence_threshold_frame.grid(row=row, column=0, sticky=(tk.W, tk.E), pady=2)
         row += 1
         ttk.Label(violence_threshold_frame, text="Violence:").grid(row=0, column=0, sticky=tk.W)
-        violence_threshold_scale = ttk.Scale(violence_threshold_frame, from_=0.1, to=0.9, orient=tk.HORIZONTAL,
+        violence_threshold_scale = ttk.Scale(violence_threshold_frame, from_=0.1, to=1.0, orient=tk.HORIZONTAL,
                                            variable=self.violence_threshold, length=100)
         violence_threshold_scale.grid(row=0, column=1, padx=(5, 5))
-        self.violence_threshold_label = ttk.Label(violence_threshold_frame, text="0.50")
+        self.violence_threshold_label = ttk.Label(violence_threshold_frame, text="0.99")
         self.violence_threshold_label.grid(row=0, column=2)
         violence_threshold_scale.configure(command=self.update_violence_threshold_label)
         
@@ -489,6 +777,32 @@ class DetectionGUI:
         violence_delay_spinbox = ttk.Spinbox(violence_delay_frame, from_=5, to=300, width=8, textvariable=self.violence_alert_delay)
         violence_delay_spinbox.grid(row=0, column=1, padx=(5, 5))
         ttk.Label(violence_delay_frame, text="sec").grid(row=0, column=2, sticky=tk.W)
+        
+        # Messaging Settings
+        ttk.Label(control_frame, text="Messaging Settings:", font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
+        row += 1
+        
+        messaging_frame = ttk.Frame(control_frame)
+        messaging_frame.grid(row=row, column=0, sticky=tk.W, pady=2)
+        row += 1
+        
+        messaging_check = ttk.Checkbutton(messaging_frame, text="Enable WhatsApp Messaging", 
+                                         variable=self.messaging_enabled, 
+                                         command=self.on_messaging_toggle)
+        messaging_check.grid(row=0, column=0, sticky=tk.W)
+        
+        # Messaging status indicator
+        self.messaging_status_label = ttk.Label(messaging_frame, text="✓ Enabled", foreground="green")
+        self.messaging_status_label.grid(row=0, column=1, padx=(10, 0))
+        
+        # Messaging delay
+        ttk.Label(messaging_frame, text="Message Delay (sec):").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        self.messaging_delay = tk.IntVar(value=20)
+        self.messaging_delay_spinbox = ttk.Spinbox(messaging_frame, from_=10, to=60, width=5, textvariable=self.messaging_delay)
+        self.messaging_delay_spinbox.grid(row=1, column=1, sticky=tk.W, pady=(8, 0), padx=(5, 0))
+        
+        # Warning label
+        ttk.Label(messaging_frame, text="(Minimum 15–20 sec recommended for WhatsApp Web)", foreground="orange").grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         
         # Frame processing interval
         ttk.Label(control_frame, text="Performance Settings:", font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
@@ -581,8 +895,11 @@ class DetectionGUI:
         self.clear_alerts_btn = ttk.Button(alert_controls, text="Clear All", command=self.clear_all_alerts)
         self.clear_alerts_btn.grid(row=0, column=1, padx=(0, 5))
         
+        self.stats_btn = ttk.Button(alert_controls, text="Stats", command=self.show_alert_statistics)
+        self.stats_btn.grid(row=0, column=2, padx=(0, 5))
+        
         self.alert_count_label = ttk.Label(alert_controls, text="Alerts: 0", font=('Arial', 10, 'bold'))
-        self.alert_count_label.grid(row=0, column=2, padx=(10, 0))
+        self.alert_count_label.grid(row=0, column=3, padx=(10, 0))
         
         # Alerts list
         alerts_list_frame = ttk.Frame(alerts_frame)
@@ -732,6 +1049,17 @@ Use the Detection System tab to select which camera to use for monitoring."""
         
         self.performance_label.config(text=text, foreground=color)
         
+    def on_messaging_toggle(self):
+        """Handle messaging toggle state change"""
+        if self.messaging_enabled.get():
+            self.alert_system.whatsapp_enabled = True
+            self.messaging_status_label.config(text="✓ Enabled", foreground="green")
+            self.log_result("WhatsApp messaging enabled")
+        else:
+            self.alert_system.whatsapp_enabled = False
+            self.messaging_status_label.config(text="✗ Disabled", foreground="red")
+            self.log_result("WhatsApp messaging disabled")
+        
     def update_status(self, message, color="black"):
         self.status_label.config(text=message, foreground=color)
         self.root.update_idletasks()
@@ -817,6 +1145,61 @@ Use the Detection System tab to select which camera to use for monitoring."""
             self.refresh_alerts_display()
             self.preview_canvas.delete("all")
             self.log_result("All alerts cleared")
+            
+    def show_alert_statistics(self):
+        """Show alert statistics in a popup window"""
+        stats = self.alert_system.get_alert_statistics()
+        
+        if not stats:
+            messagebox.showinfo("Alert Statistics", "No alert statistics available.")
+            return
+            
+        # Create statistics window
+        stats_window = tk.Toplevel(self.root)
+        stats_window.title("Alert Statistics")
+        stats_window.geometry("600x400")
+        stats_window.transient(self.root)
+        stats_window.grab_set()
+        
+        # Center the window
+        stats_window.update_idletasks()
+        x = (stats_window.winfo_screenwidth() // 2) - (stats_window.winfo_width() // 2)
+        y = (stats_window.winfo_screenheight() // 2) - (stats_window.winfo_height() // 2)
+        stats_window.geometry(f"+{x}+{y}")
+        
+        # Create text widget for statistics
+        text_widget = tk.Text(stats_window, wrap=tk.WORD, padx=10, pady=10)
+        scrollbar = ttk.Scrollbar(stats_window, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        text_widget.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        stats_window.columnconfigure(0, weight=1)
+        stats_window.rowconfigure(0, weight=1)
+        
+        # Format and display statistics
+        text_widget.insert(tk.END, "ALERT STATISTICS\n")
+        text_widget.insert(tk.END, "=" * 50 + "\n\n")
+        
+        for alert_key, data in stats.items():
+            location, detection_type = alert_key.split('_', 1)
+            text_widget.insert(tk.END, f"Location: {location}\n")
+            text_widget.insert(tk.END, f"Detection Type: {detection_type.title()}\n")
+            text_widget.insert(tk.END, f"Total Alerts: {data['total_alerts']}\n")
+            text_widget.insert(tk.END, f"Last Alert: {data['last_alert'][:19]}\n")
+            text_widget.insert(tk.END, f"Time Since Last: {data['time_since_last']:.1f} seconds\n")
+            text_widget.insert(tk.END, f"Last Confidence: {data['last_confidence']:.3f}\n")
+            text_widget.insert(tk.END, "-" * 30 + "\n\n")
+        
+        # Add messaging status
+        text_widget.insert(tk.END, f"Messaging Status: {'Enabled' if self.alert_system.is_messaging_enabled() else 'Disabled'}\n")
+        
+        text_widget.config(state=tk.DISABLED)  # Make read-only
+        
+        # Close button
+        close_btn = ttk.Button(stats_window, text="Close", command=stats_window.destroy)
+        close_btn.grid(row=1, column=0, pady=10)
         
     def load_models(self):
         """Load the AI models"""
@@ -1036,27 +1419,31 @@ Use the Detection System tab to select which camera to use for monitoring."""
                 # Fire alert
                 if fire_label == "fire" and fire_probs is not None:
                     confidence = fire_probs[0]
-                    if self.alert_system.can_create_alert("fire", self.fire_alert_delay.get()):
+                    if self.alert_system.can_create_alert("fire", self.fire_alert_delay.get(), camera_info['location'], confidence):
                         alert = self.alert_system.save_alert(frame, "fire", confidence, camera_info,
-                                                           {"probabilities": fire_probs.tolist()})
+                                                           {"probabilities": fire_probs.tolist()},
+                                                           self.messaging_delay.get())
                         self.log_result(f"🔥 FIRE ALERT! {camera_info['location']} - Confidence: {confidence:.3f}")
                         alert_triggered = True
                     else:
-                        # Still log detection but don't create alert
-                        self.log_result(f"🔥 Fire detected (alert suppressed) - {camera_info['location']}")
+                        # Show time remaining until next alert
+                        time_remaining = self.alert_system.get_time_until_next_alert("fire", self.fire_alert_delay.get(), camera_info['location'])
+                        self.log_result(f"🔥 Fire detected (alert suppressed) - {camera_info['location']} - Next alert in {time_remaining:.1f}s")
                 
                 # Violence alert
                 if violence_label == "Violence" and violence_probs is not None:
                     confidence = violence_probs[1]  # Violence class confidence
                     if confidence >= self.violence_threshold.get():
-                        if self.alert_system.can_create_alert("violence", self.violence_alert_delay.get()):
+                        if self.alert_system.can_create_alert("violence", self.violence_alert_delay.get(), camera_info['location'], confidence):
                             alert = self.alert_system.save_alert(frame, "violence", confidence, camera_info,
-                                                               {"probabilities": violence_probs.tolist()})
+                                                               {"probabilities": violence_probs.tolist()},
+                                                               self.messaging_delay.get())
                             self.log_result(f"⚠️ VIOLENCE ALERT! {camera_info['location']} - Confidence: {confidence:.3f}")
                             alert_triggered = True
                         else:
-                            # Still log detection but don't create alert
-                            self.log_result(f"⚠️ Violence detected (alert suppressed) - {camera_info['location']}")
+                            # Show time remaining until next alert
+                            time_remaining = self.alert_system.get_time_until_next_alert("violence", self.violence_alert_delay.get(), camera_info['location'])
+                            self.log_result(f"⚠️ Violence detected (alert suppressed) - {camera_info['location']} - Next alert in {time_remaining:.1f}s")
                 
                 # Refresh alerts display if new alert was triggered
                 if alert_triggered:

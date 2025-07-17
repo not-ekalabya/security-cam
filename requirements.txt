@@ -1,0 +1,8 @@
+opencv-python
+numpy
+torch
+tensorflow
+keras
+pywhatkit
+pyttsx3
+pillow
